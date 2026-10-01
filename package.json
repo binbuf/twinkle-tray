@@ -28,7 +28,7 @@
     "set-brightness",
     "windows"
   ],
-  "author": "Xander Frangos",
+  "author": "binbuf",
   "license": "MIT",
   "dependencies": {
     "@hensm/ddcci": "file:src/modules/node-ddcci",
@@ -55,7 +55,7 @@
   },
   "build": {
     "productName": "Twinkle Tray",
-    "appId": "com.xanderfrangos.twinkle-tray",
+    "appId": "com.binbuf.twinkle-tray",
     "compression": "normal",
     "electronLanguages": ["en-US"],
     "afterPack": "resources/afterPack.js",
@@ -74,6 +74,7 @@
       "src/Utils.js",
       "src/Logger.js",
       "src/Monitors.js",
+      "src/NightLight.js",
       "src/wmi-bridge-test.js",
       "src/vcp-codes.js",
       "src/assets/tray-icons/dark/*.ico",
@@ -184,15 +185,14 @@
         "nsis"
       ],
       "artifactName": "${productName} v${version}.${ext}",
-      "icon": "src/assets/logo.ico",
-      "legalTrademarks": "Xander Frangos"
+      "icon": "src/assets/logo.ico"
     },
     "appx": {
-      "publisherDisplayName": "Xander Frangos",
+      "publisherDisplayName": "binbuf",
       "applicationId": "TwinkleTray",
       "displayName": "Twinkle Tray",
-      "identityName": "38002AlexanderFrangos.TwinkleTray",
-      "publisher": "CN=B8E9A58B-32A7-4C6C-A474-D4BE2A3CEAD8",
+      "identityName": "binbuf.TwinkleTray",
+      "publisher": "CN=AppModelSamples, OID.2.25.311729368913984317654407730594956997722=1",
       "showNameOnTiles": false,
       "backgroundColor": "#6b479c",
       "addAutoLaunchExtension": true,

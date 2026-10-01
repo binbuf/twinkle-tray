@@ -1,0 +1,104 @@
+name: Sync upstream
+
+# GitHub has no native automatic fork sync, and upstream pushes do not emit
+# events in forks, so this runs on a schedule (or manually) and opens a pull
+# request with the upstream changes for you to review.
+#
+# IMPORTANT: this workflow needs a repository secret named SYNC_TOKEN.
+# The default GITHUB_TOKEN is blocked by GitHub from pushing ANY commit that
+# changes a file under .github/workflows/, and upstream edits ci.yml, so a PAT
+# is required for the sync branch push to succeed. Create a classic token with
+# the "workflow" scope (or a fine-grained token with Contents + Pull requests +
+# Workflows: Read and write) and store it as the SYNC_TOKEN secret.
+#
+# Without SYNC_TOKEN this falls back to GITHUB_TOKEN and will only work on runs
+# where upstream didn't touch any workflow file.
+
+on:
+  schedule:
+    # Daily at 06:00 UTC. Fork scheduled workflows are disabled by default;
+    # enable Actions in the fork, and note GitHub disables cron jobs after
+    # ~60 days of repository inactivity.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream into a pull request
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Read fork
+        uses: actions/checkout@v6
+        with:
+          # Wire the PAT into checkout so the stored git credential can push
+          # workflow-file changes; setting it on the push step alone is not enough.
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/xanderfrangos/twinkle-tray.git
+
+      - name: Fetch upstream
+        run: git fetch upstream master
+
+      - name: Create sync branch
+        run: git checkout -B sync-upstream
+
+      - name: Merge upstream/master
+        id: merge
+        continue-on-error: true
+        run: git merge upstream/master --no-edit
+
+      - name: Count new commits
+        id: changes
+        if: steps.merge.outcome == 'success'
+        run: echo "count=$(git rev-list --count master..sync-upstream)" >> "$GITHUB_OUTPUT"
+
+      - name: Push sync branch
+        if: steps.merge.outcome == 'success' && steps.changes.outputs.count != '0'
+        run: git push --force origin sync-upstream
+
+      - name: Open or update pull request
+        if: steps.merge.outcome == 'success' && steps.changes.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          if gh pr list --head sync-upstream --state open --json number --jq '.[0].number' | grep -q .; then
+            echo "Upstream sync PR is already open."
+          else
+            gh pr create \
+              --base master \
+              --head sync-upstream \
+              --title "Sync upstream (xanderfrangos/twinkle-tray)" \
+              --body "Automated merge of \`xanderfrangos/twinkle-tray@master\` into this fork. Review the changes before merging."
+          fi
+
+      - name: Report merge conflict
+        if: steps.merge.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          git merge --abort || true
+          if gh issue list --state open --search '"Upstream sync conflict" in:title' --json number --jq '.[0].number' | grep -q .; then
+            echo "Conflict issue is already open."
+          else
+            gh issue create \
+              --title "Upstream sync conflict" \
+              --body "The automatic merge of \`xanderfrangos/twinkle-tray@master\` into this fork produced conflicts and could not be opened as a pull request. Resolve them manually — see the failed **Sync upstream** workflow run for the conflicting files."
+          fi
+          exit 1

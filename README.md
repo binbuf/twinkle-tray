@@ -3,9 +3,11 @@
 </p>
 <h1 align="center">Twinkle Tray</h1>
 
-<p align="center"><a href="https://github.com/xanderfrangos/twinkle-tray/releases" target="_blank"><img src="https://img.shields.io/github/v/release/xanderfrangos/twinkle-tray" alt="Latest release" /></a> <a href="https://github.com/xanderfrangos/twinkle-tray/releases" target="_blank"><img src="https://img.shields.io/github/downloads/xanderfrangos/twinkle-tray/total" alt="Total downloads" /></a> <a href="https://hosted.weblate.org/projects/twinkle-tray/twinkle-tray/" target="_blank"><img src="https://hosted.weblate.org/widgets/twinkle-tray/-/twinkle-tray/svg-badge.svg" alt="Translations" /></a></p>
+<p align="center"><a href="https://github.com/binbuf/twinkle-tray/releases" target="_blank"><img src="https://img.shields.io/github/v/release/binbuf/twinkle-tray" alt="Latest release" /></a> <a href="https://github.com/binbuf/twinkle-tray/releases" target="_blank"><img src="https://img.shields.io/github/downloads/binbuf/twinkle-tray/total" alt="Total downloads" /></a> <a href="https://hosted.weblate.org/projects/twinkle-tray/twinkle-tray/" target="_blank"><img src="https://hosted.weblate.org/widgets/twinkle-tray/-/twinkle-tray/svg-badge.svg" alt="Translations" /></a></p>
 
 Twinkle Tray enables brightness control on external displays in Windows 10 & 11. Even though Windows is capable of adjusting the backlight on most monitors, it doesn't support external monitors natively. Windows also lacks any options to manage the brightness of multiple displays. This app inserts a new icon into your system tray, where you can click to have instant access to the brightness levels of all compatible displays. 
+
+> **Unofficial fork.** This is a personal fork of [Twinkle Tray](https://github.com/xanderfrangos/twinkle-tray), originally created by [Xander Frangos](https://xanderfrangos.com). All original credit belongs to him. This fork is maintained by [binbuf](https://github.com/binbuf) and publishes its own builds; it is not affiliated with, endorsed by, or supported by the original author or [twinkletray.com](https://twinkletray.com/). 
 
 <img src="https://raw.githubusercontent.com/xanderfrangos/twinkle-tray/gh-pages/assets/img/tt-screenshot-w11.jpg" alt="Win 10 brightness slider" />
 
@@ -26,7 +28,9 @@ Twinkle Tray will automatically adjust the look and feel to match your Windows v
 
 ## Download
 
-**Download the lastest version from [twinkletray.com](https://twinkletray.com/) or the [Releases page](https://github.com/xanderfrangos/twinkle-tray/releases).**
+**Download the latest version from this fork's [Releases page](https://github.com/binbuf/twinkle-tray/releases).**
+
+*Looking for the original project? See [xanderfrangos/twinkle-tray](https://github.com/xanderfrangos/twinkle-tray) and its [Microsoft Store listing](https://www.microsoft.com/store/productId/9PLJWWSV01LK).*
 
 <a href="https://www.microsoft.com/store/productId/9PLJWWSV01LK" target="_blank"><img width="156" src="https://crushee.app/assets/img/ms-store.svg" alt="Get Twinkle Tray brightness slider from the Microsoft Store"></a>
 
@@ -73,7 +77,7 @@ scoop update twinkle-tray
 
 ## Usage
 
-- Download from the [Releases page](https://github.com/xanderfrangos/twinkle-tray/releases) and run the installer EXE.
+- Download from this fork's [Releases page](https://github.com/binbuf/twinkle-tray/releases) and run the installer EXE.
 - Once installation has finished, you should see the Twinkle Tray icon in your system tray. 
 - Click the icon to bring up the Adjust Brightness flyout. 
 - Click away to hide the flyout.
@@ -135,6 +139,8 @@ Twinkle Tray was built using frameworks & libraries such as [Electron](https://e
 ## License
 
 Copyright © 2020 Xander Frangos
+
+Fork modifications Copyright © 2026 binbuf. This is an unofficial fork; the original copyright notice above is retained as required by the MIT License.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 
