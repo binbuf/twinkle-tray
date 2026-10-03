@@ -3,11 +3,24 @@
 </p>
 <h1 align="center">Twinkle Tray</h1>
 
-<p align="center"><a href="https://github.com/binbuf/twinkle-tray/releases" target="_blank"><img src="https://img.shields.io/github/v/release/binbuf/twinkle-tray" alt="Latest release" /></a> <a href="https://github.com/binbuf/twinkle-tray/releases" target="_blank"><img src="https://img.shields.io/github/downloads/binbuf/twinkle-tray/total" alt="Total downloads" /></a> <a href="https://hosted.weblate.org/projects/twinkle-tray/twinkle-tray/" target="_blank"><img src="https://hosted.weblate.org/widgets/twinkle-tray/-/twinkle-tray/svg-badge.svg" alt="Translations" /></a></p>
+**Unofficial, forked release.** This is a fork of [Twinkle Tray](https://github.com/xanderfrangos/twinkle-tray), originally created by [Xander Frangos](https://xanderfrangos.com). All original credit belongs to him. This fork is maintained by [binbuf](https://github.com/binbuf) and publishes its own builds; it is not affiliated with, endorsed by, or supported by the original author or [twinkletray.com](https://twinkletray.com/). 
+
+## Features Added
+
+* Night Light
+* Dark Mode
+
+<p align="center">
+  <img width="285" height="299" alt="662700018-61693e6a-2472-4329-a21c-990f19604ec0" src="https://github.com/user-attachments/assets/012422a8-512c-4581-955a-cdaaf58e7428" />
+  <img width="450" alt="662700412-3a086b2a-22fa-4174-8a6f-272f2dd966c4" src="https://github.com/user-attachments/assets/06976057-41d3-4bd3-aaa7-626c20b442f5" />
+
+</p>
+
+---
 
 Twinkle Tray enables brightness control on external displays in Windows 10 & 11. Even though Windows is capable of adjusting the backlight on most monitors, it doesn't support external monitors natively. Windows also lacks any options to manage the brightness of multiple displays. This app inserts a new icon into your system tray, where you can click to have instant access to the brightness levels of all compatible displays. 
 
-> **Unofficial fork.** This is a personal fork of [Twinkle Tray](https://github.com/xanderfrangos/twinkle-tray), originally created by [Xander Frangos](https://xanderfrangos.com). All original credit belongs to him. This fork is maintained by [binbuf](https://github.com/binbuf) and publishes its own builds; it is not affiliated with, endorsed by, or supported by the original author or [twinkletray.com](https://twinkletray.com/). 
+<p align="center"><a href="https://github.com/binbuf/twinkle-tray/releases" target="_blank"><img src="https://img.shields.io/github/v/release/binbuf/twinkle-tray" alt="Latest release" /></a> <a href="https://github.com/binbuf/twinkle-tray/releases" target="_blank"><img src="https://img.shields.io/github/downloads/binbuf/twinkle-tray/total" alt="Total downloads" /></a> <a href="https://hosted.weblate.org/projects/twinkle-tray/twinkle-tray/" target="_blank"><img src="https://hosted.weblate.org/widgets/twinkle-tray/-/twinkle-tray/svg-badge.svg" alt="Translations" /></a></p>
 
 <img src="https://raw.githubusercontent.com/xanderfrangos/twinkle-tray/gh-pages/assets/img/tt-screenshot-w11.jpg" alt="Win 10 brightness slider" />
 
