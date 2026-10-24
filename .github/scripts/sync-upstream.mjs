@@ -86,7 +86,8 @@ function restoreForkWorkflows(forkSha) {
   // Restore the fork versions of every file that exists in both places.
   git(['checkout', forkSha, '--', ...FORK_WORKFLOW_PATHS], { allowFailure: true });
 
-  return gitLines(['diff', '--name-only', forkSha, '--', ...FORK_WORKFLOW_PATHS]).length > 0;
+  // Stage additions/modifications/deletions so the caller can commit them.
+  git(['add', '-A', '--', ...FORK_WORKFLOW_PATHS]);
 }
 
 function main() {
@@ -165,16 +166,19 @@ function main() {
 
   // Keep workflow files byte-for-byte identical to the fork's pre-merge copy.
   // This is what lets a normal GITHUB_TOKEN push succeed.
-  const workflowsChanged = restoreForkWorkflows(beforeSha);
-  if (workflowsChanged) {
-    git(['add', '-A', '--', ...FORK_WORKFLOW_PATHS]);
-    const stagedWorkflows = git(['diff', '--cached', '--name-only']).stdout;
-    if (stagedWorkflows) {
-      // A separate commit is intentional. Amending a merge commit here has
-      // proven unreliable in detached checkouts, and the extra commit is
-      // harmless.
-      git(['commit', '-m', 'Keep fork workflows']);
-    }
+  restoreForkWorkflows(beforeSha);
+  const stagedWorkflows = git([
+    'diff',
+    '--cached',
+    '--name-only',
+    '--',
+    ...FORK_WORKFLOW_PATHS,
+  ]).stdout;
+  if (stagedWorkflows) {
+    // A separate commit is intentional. Amending a merge commit here has
+    // proven unreliable in detached checkouts, and the extra commit is
+    // harmless.
+    git(['commit', '-m', 'Keep fork workflows']);
   }
 
   const workflowDiff = gitLines(['diff', '--name-only', beforeSha, 'HEAD', '--', ...FORK_WORKFLOW_PATHS]);
