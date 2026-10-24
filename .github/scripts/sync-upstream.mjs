@@ -168,9 +168,11 @@ function main() {
   const workflowsChanged = restoreForkWorkflows(beforeSha);
   if (workflowsChanged) {
     git(['add', '-A', '--', ...FORK_WORKFLOW_PATHS]);
-    if (git(['rev-parse', 'HEAD']).stdout !== beforeSha) {
-      git(['commit', '--amend', '--no-edit']);
-    } else {
+    const stagedWorkflows = git(['diff', '--cached', '--name-only']).stdout;
+    if (stagedWorkflows) {
+      // A separate commit is intentional. Amending a merge commit here has
+      // proven unreliable in detached checkouts, and the extra commit is
+      // harmless.
       git(['commit', '-m', 'Keep fork workflows']);
     }
   }
