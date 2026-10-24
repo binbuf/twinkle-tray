@@ -16,7 +16,7 @@ on:
   schedule:
     # Fork scheduled workflows are disabled after ~60 days of repository
     # inactivity, and scheduled runs can be delayed during busy periods.
-    - cron: "0 6,18 * * *"
+    - cron: "0 */6 * * *"
   workflow_dispatch:
 
 permissions:
@@ -57,6 +57,18 @@ jobs:
         env:
           UPSTREAM_URL: https://github.com/xanderfrangos/twinkle-tray.git
           FORK_BRANCH: master
+
+      - name: Write failure summary
+        if: failure()
+        run: |
+          {
+            echo "### Upstream sync needs attention"
+            echo ""
+            echo "The automatic merge could not be completed. The job log above lists the conflicting files."
+            echo "Resolve them locally, commit and push to \`master\`; the next scheduled run will resume automatically."
+            echo ""
+            echo "Conflicts in \`.github/workflows\`, \`README.md\`, \`package.json\` and \`package-lock.json\` are handled automatically."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   detect-release:
     name: Check for a new upstream release
