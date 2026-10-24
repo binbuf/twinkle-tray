@@ -142,13 +142,21 @@ jobs:
           name: twinkle-tray-nightlightdarkmode-${{ steps.meta.outputs.version }}
           path: dist/*.exe
 
+      - name: Compose release notes
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          UPSTREAM_REPO: xanderfrangos/twinkle-tray
+          UPSTREAM_TAG: ${{ steps.meta.outputs.upstream_tag }}
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+          NOTES_FILE: ${{ runner.temp }}/release-notes.md
+        run: node .github/scripts/compose-release-notes.mjs
+
       - name: Publish GitHub release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.meta.outputs.tag }}
-          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
-          UPSTREAM_TAG: ${{ steps.meta.outputs.upstream_tag }}
           RELEASE_TITLE: ${{ steps.meta.outputs.title }}
           RELEASE_PRERELEASE: ${{ steps.meta.outputs.prerelease }}
         run: |
@@ -156,33 +164,7 @@ jobs:
           $assets = @(Get-ChildItem -Path dist -Filter *.exe | ForEach-Object { $_.FullName })
           if ($assets.Count -eq 0) { throw "No installer was produced in dist/." }
 
-          $upstreamBody = ""
-          try {
-            # PowerShell returns external command output as an array of lines;
-            # join it back so the release notes keep their Markdown layout.
-            $upstreamBody = (gh release view $env:UPSTREAM_TAG -R xanderfrangos/twinkle-tray --json body --jq .body 2>$null) -join "`n"
-          } catch {
-            Write-Host "Could not read upstream release notes for $env:UPSTREAM_TAG; using generated notes."
-          }
-
           $notesFile = Join-Path $env:RUNNER_TEMP "release-notes.md"
-          $footer = @(
-            '',
-            '---',
-            '',
-            'This is an unofficial fork build of [Twinkle Tray](https://github.com/xanderfrangos/twinkle-tray) with Night Light and Dark Mode additions.',
-            '',
-            "* Upstream release: https://github.com/xanderfrangos/twinkle-tray/releases/tag/$env:UPSTREAM_TAG",
-            "* Fork source: https://github.com/$repo",
-            "* Built version: $env:RELEASE_VERSION"
-          ) -join "`n"
-
-          if ([string]::IsNullOrWhiteSpace($upstreamBody)) {
-            $body = "Fork build of Twinkle Tray $env:RELEASE_VERSION.`n$footer"
-          } else {
-            $body = "$upstreamBody`n$footer"
-          }
-          Set-Content -Path $notesFile -Value $body -Encoding utf8
 
           $exists = $false
           gh release view $env:RELEASE_TAG -R $repo 2>$null | Out-Null
