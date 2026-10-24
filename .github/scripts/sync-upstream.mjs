@@ -6,8 +6,12 @@
  *   1. Fork-owned files (.github/workflows, FUNDING.yml, README.md) -> keep fork.
  *   2. package.json / package-lock.json -> take upstream, then re-apply fork
  *      branding with apply-fork-branding.mjs.
- *   3. Anything else -> abort and fail the workflow. Those conflicts need a
- *      human because blindly picking a side can break the feature.
+ *   3. Anything else -> do not touch master. Commit the attempted merge to a
+ *      sync-upstream-conflict branch and open a PR for manual review.
+ *
+ * A second safety net verifies that the Night Light / Dark Mode feature is
+ * still present after the merge. If upstream refactors a file the feature
+ * depends on, master is left alone and the review PR is opened instead.
  *
  * Workflow files are always restored to the fork versions before the commit is
  * pushed. This is deliberate: GitHub's GITHUB_TOKEN cannot push a commit that
@@ -22,7 +26,53 @@ const UPSTREAM_URL =
   process.env.UPSTREAM_URL || 'https://github.com/xanderfrangos/twinkle-tray.git';
 const UPSTREAM_BRANCH = process.env.UPSTREAM_BRANCH || 'master';
 const FORK_BRANCH = process.env.FORK_BRANCH || 'master';
+const CONFLICT_BRANCH = process.env.CONFLICT_BRANCH || 'sync-upstream-conflict';
+const REPO = process.env.GITHUB_REPOSITORY || 'binbuf/twinkle-tray';
+const SERVER_URL = process.env.GITHUB_SERVER_URL || 'https://github.com';
+const RUN_URL = process.env.GITHUB_RUN_ID
+  ? `${SERVER_URL}/${REPO}/actions/runs/${process.env.GITHUB_RUN_ID}`
+  : '';
 const FORK_WORKFLOW_PATHS = ['.github/workflows', '.github/FUNDING.yml'];
+
+// These are the load-bearing pieces of the fork feature. If upstream removes
+// or renames one of them, the merge may be syntactically clean but the feature
+// would silently disappear. In that case we open the review PR instead of
+// pushing to master.
+const FEATURE_CHECKS = [
+  {
+    label: 'Night Light module',
+    file: 'src/NightLight.js',
+  },
+  {
+    label: 'registry watcher native module',
+    file: 'src/modules/tt-windows-utils/windows_registry_watch.cc',
+  },
+  {
+    label: 'Night Light main-process wiring',
+    file: 'src/electron.js',
+    includes: ["require('./NightLight')", 'night-light-updated'],
+  },
+  {
+    label: 'Night Light panel',
+    file: 'src/components/BrightnessPanel.jsx',
+    includes: ['nightLight'],
+  },
+  {
+    label: 'Night Light settings',
+    file: 'src/components/SettingsWindow.jsx',
+    includes: ['showNightLight'],
+  },
+  {
+    label: 'Night Light preload bridge',
+    file: 'src/panel-preload.js',
+    includes: ['request-night-light', 'set-night-light'],
+  },
+  {
+    label: 'registry watcher export',
+    file: 'src/modules/tt-windows-utils/index.js',
+    includes: ['RegistryWatcher'],
+  },
+];
 
 function log(message) {
   console.log(message);
@@ -47,6 +97,25 @@ function git(args, { allowFailure = false, stdio = 'pipe' } = {}) {
   }
 }
 
+function gh(args, { allowFailure = false } = {}) {
+  const result = spawnSync('gh', args, {
+    encoding: 'utf8',
+    env: process.env,
+  });
+  const stdout = String(result.stdout || '').trim();
+  const stderr = String(result.stderr || '').trim();
+
+  if (result.status !== 0) {
+    if (allowFailure) {
+      return { status: result.status || 1, stdout, stderr };
+    }
+    console.error(stderr);
+    throw new Error(`gh ${args.join(' ')} failed`);
+  }
+
+  return { status: 0, stdout, stderr };
+}
+
 function gitLines(args, options) {
   return git(args, options)
     .stdout.split('\n')
@@ -66,14 +135,10 @@ function isUpstreamOwned(path) {
   return path === 'package.json' || path === 'package-lock.json';
 }
 
-function isWorkflowPath(path) {
-  return (
-    path === '.github/FUNDING.yml' || path.startsWith('.github/workflows/')
-  );
-}
-
 function restoreForkWorkflows(forkSha) {
-  const forkFiles = new Set(gitLines(['ls-tree', '-r', '--name-only', forkSha, '--', ...FORK_WORKFLOW_PATHS]));
+  const forkFiles = new Set(
+    gitLines(['ls-tree', '-r', '--name-only', forkSha, '--', ...FORK_WORKFLOW_PATHS]),
+  );
 
   // Remove workflow files that only exist because upstream added them.
   const currentFiles = gitLines(['ls-files', '--', ...FORK_WORKFLOW_PATHS]);
@@ -90,6 +155,164 @@ function restoreForkWorkflows(forkSha) {
   git(['add', '-A', '--', ...FORK_WORKFLOW_PATHS]);
 }
 
+function verifyForkFeatures() {
+  const problems = [];
+
+  for (const check of FEATURE_CHECKS) {
+    if (!fs.existsSync(check.file)) {
+      problems.push(`${check.label}: missing ${check.file}`);
+      continue;
+    }
+
+    if (check.includes) {
+      const contents = fs.readFileSync(check.file, 'utf8');
+      for (const needle of check.includes) {
+        if (!contents.includes(needle)) {
+          problems.push(`${check.label}: ${check.file} no longer contains "${needle}"`);
+        }
+      }
+    }
+  }
+
+  return problems;
+}
+
+function openConflictPr(reasons) {
+  if (process.env.SYNC_SKIP_PUSH === '1') {
+    log('SYNC_SKIP_PUSH=1; skipping the conflict branch push and PR.');
+    return;
+  }
+
+  const existing = gh(
+    [
+      'pr',
+      'list',
+      '--repo',
+      REPO,
+      '--head',
+      CONFLICT_BRANCH,
+      '--state',
+      'open',
+      '--json',
+      'number',
+      '--jq',
+      '.[0].number',
+    ],
+    { allowFailure: true },
+  );
+  const prNumber = existing.stdout && existing.stdout !== 'null' ? existing.stdout : '';
+
+  if (prNumber) {
+    // Never force-push over a PR the user may already be editing. Add the
+    // latest findings as a comment instead.
+    gh(
+      [
+        'pr',
+        'comment',
+        prNumber,
+        '--repo',
+        REPO,
+        '--body',
+        `Another scheduled sync still needs review:\n\n${reasons.join('\n')}${
+          RUN_URL ? `\n\nRun: ${RUN_URL}` : ''
+        }`,
+      ],
+      { allowFailure: true },
+    );
+    log(`Conflict PR #${prNumber} is already open; added the latest details.`);
+    return;
+  }
+
+  const push = git(['push', '--force', 'origin', `HEAD:refs/heads/${CONFLICT_BRANCH}`], {
+    allowFailure: true,
+  });
+  if (push.status !== 0) {
+    if (push.stdout) console.error(push.stdout);
+    if (push.stderr) console.error(push.stderr);
+    console.error(`Could not push ${CONFLICT_BRANCH}.`);
+    return;
+  }
+
+  const body = [
+    `Automated merge of \`xanderfrangos/twinkle-tray@${process.env.SYNC_UPSTREAM_SHA || 'master'}\` into \`${FORK_BRANCH}\` needs review.`,
+    '',
+    '## What needs attention',
+    '',
+    ...reasons.map((reason) => `- ${reason}`),
+    '',
+    '## How to resolve',
+    '',
+    `This branch contains the attempted merge. If there are conflict markers, resolve them in the PR and merge it (or push the same resolution to \`${FORK_BRANCH}\`). If the feature check failed, update the feature integration in this branch and merge it.`,
+    '',
+    `The next scheduled sync will keep running, but it will not push to \`${FORK_BRANCH}\` while this work is outstanding.`,
+    ...(RUN_URL ? ['', `Failed run: ${RUN_URL}`] : []),
+  ].join('\n');
+
+  const created = gh(
+    [
+      'pr',
+      'create',
+      '--repo',
+      REPO,
+      '--base',
+      FORK_BRANCH,
+      '--head',
+      CONFLICT_BRANCH,
+      '--title',
+      'Upstream sync needs conflict resolution',
+      '--body',
+      body,
+    ],
+    { allowFailure: true },
+  );
+
+  if (created.status !== 0) {
+    console.error(created.stderr);
+    console.error(`Pushed ${CONFLICT_BRANCH}, but could not open the PR.`);
+    return;
+  }
+
+  log(`Opened conflict PR: ${created.stdout}`);
+}
+
+function commentOnStaleConflictPr() {
+  if (process.env.SYNC_SKIP_PUSH === '1') return;
+
+  const existing = gh(
+    [
+      'pr',
+      'list',
+      '--repo',
+      REPO,
+      '--head',
+      CONFLICT_BRANCH,
+      '--state',
+      'open',
+      '--json',
+      'number',
+      '--jq',
+      '.[0].number',
+    ],
+    { allowFailure: true },
+  );
+  const prNumber = existing.stdout && existing.stdout !== 'null' ? existing.stdout : '';
+  if (!prNumber) return;
+
+  gh(
+    [
+      'pr',
+      'comment',
+      prNumber,
+      '--repo',
+      REPO,
+      '--body',
+      `A scheduled sync now merges upstream cleanly. This conflict PR can be closed if you no longer need it.`,
+    ],
+    { allowFailure: true },
+  );
+  log(`Conflict PR #${prNumber} is now stale; added a comment instead of closing it.`);
+}
+
 function main() {
   git(['config', 'user.name', process.env.GIT_AUTHOR_NAME || 'github-actions[bot]']);
   git([
@@ -102,27 +325,31 @@ function main() {
   const beforeSha = git(['rev-parse', 'HEAD']).stdout;
   log(`Fork before sync: ${beforeSha}`);
 
-  git(['fetch', '--no-tags', UPSTREAM_URL, `+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}`]);
+  git([
+    'fetch',
+    '--no-tags',
+    UPSTREAM_URL,
+    `+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}`,
+  ]);
   const upstreamRef = `upstream/${UPSTREAM_BRANCH}`;
   const upstreamSha = git(['rev-parse', upstreamRef]).stdout;
   const upstreamVersion = JSON.parse(
     git(['show', `${upstreamRef}:package.json`]).stdout,
   ).version;
   log(`Upstream: ${upstreamSha} (${upstreamVersion})`);
+  process.env.SYNC_UPSTREAM_SHA = upstreamSha;
 
   // Namespaced tags are used by detect-upstream-release.mjs and cannot collide
   // with the fork's own release tags.
   git(
-    [
-      'fetch',
-      '--no-tags',
-      UPSTREAM_URL,
-      '+refs/tags/*:refs/upstream-tags/*',
-    ],
+    ['fetch', '--no-tags', UPSTREAM_URL, '+refs/tags/*:refs/upstream-tags/*'],
     { allowFailure: true },
   );
 
-  const merge = git(['merge', '--no-ff', '--no-edit', upstreamRef], { allowFailure: true });
+  const reviewReasons = [];
+  const merge = git(['merge', '--no-ff', '--no-edit', upstreamRef], {
+    allowFailure: true,
+  });
   if (merge.stdout) log(merge.stdout);
   if (merge.stderr) console.error(merge.stderr);
 
@@ -151,16 +378,13 @@ function main() {
     }
 
     if (unresolved.length) {
-      git(['merge', '--abort'], { allowFailure: true });
-      console.error('');
-      console.error('Upstream merge needs a human for these files:');
-      for (const file of unresolved) console.error(`  - ${file}`);
-      console.error('');
-      console.error('Resolve them locally, commit, and push master. The next');
-      console.error('scheduled sync will resume automatically.');
-      process.exit(1);
+      reviewReasons.push(`Merge conflicts need resolution: ${unresolved.join(', ')}`);
+      log('Committing the attempted merge with conflict markers for review...');
     }
 
+    // If there are unresolved files their conflict markers are staged too, so
+    // this commits the merge without ever pushing it to master.
+    git(['add', '-A']);
     git(['commit', '--no-edit']);
   }
 
@@ -181,7 +405,14 @@ function main() {
     git(['commit', '-m', 'Keep fork workflows']);
   }
 
-  const workflowDiff = gitLines(['diff', '--name-only', beforeSha, 'HEAD', '--', ...FORK_WORKFLOW_PATHS]);
+  const workflowDiff = gitLines([
+    'diff',
+    '--name-only',
+    beforeSha,
+    'HEAD',
+    '--',
+    ...FORK_WORKFLOW_PATHS,
+  ]);
   if (workflowDiff.length) {
     console.error('Refusing to push: workflow files still differ.');
     console.error(workflowDiff.join('\n'));
@@ -207,7 +438,30 @@ function main() {
     git(['commit', '-m', 'Apply fork branding']);
   }
 
+  // Safety net: verify the fork feature still exists before touching master.
+  const featureProblems = verifyForkFeatures();
+  if (featureProblems.length) {
+    reviewReasons.push(...featureProblems.map((problem) => `Fork feature check failed: ${problem}`));
+  }
+
   const afterSha = git(['rev-parse', 'HEAD']).stdout;
+
+  if (reviewReasons.length) {
+    console.error('');
+    console.error('Upstream sync needs a human:');
+    for (const reason of reviewReasons) console.error(`  - ${reason}`);
+    console.error('');
+    console.error(`Master was not changed. Review PR branch: ${CONFLICT_BRANCH}`);
+    openConflictPr(reviewReasons);
+    process.exit(1);
+  }
+
+  if (process.env.GITHUB_OUTPUT) {
+    fs.appendFileSync(
+      process.env.GITHUB_OUTPUT,
+      `changed=${afterSha !== beforeSha}\nsha=${afterSha}\nupstream_sha=${upstreamSha}\nupstream_version=${upstreamVersion}\n`,
+    );
+  }
 
   if (afterSha === beforeSha) {
     log('Already up to date; nothing to push.');
@@ -222,13 +476,7 @@ function main() {
       process.exit(1);
     }
     log(`Pushed ${afterSha} to ${FORK_BRANCH}.`);
-  }
-
-  if (process.env.GITHUB_OUTPUT) {
-    fs.appendFileSync(
-      process.env.GITHUB_OUTPUT,
-      `changed=${afterSha !== beforeSha}\nsha=${afterSha}\nupstream_sha=${upstreamSha}\nupstream_version=${upstreamVersion}\n`,
-    );
+    commentOnStaleConflictPr();
   }
 
   log('Sync complete.');

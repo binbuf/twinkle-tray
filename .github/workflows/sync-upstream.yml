@@ -21,6 +21,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
   group: sync-upstream
@@ -64,10 +65,11 @@ jobs:
           {
             echo "### Upstream sync needs attention"
             echo ""
-            echo "The automatic merge could not be completed. The job log above lists the conflicting files."
-            echo "Resolve them locally, commit and push to \`master\`; the next scheduled run will resume automatically."
+            echo "\`master\` was not changed. The attempted merge was pushed to \`sync-upstream-conflict\` and a pull request was opened (or updated) for review."
             echo ""
-            echo "Conflicts in \`.github/workflows\`, \`README.md\`, \`package.json\` and \`package-lock.json\` are handled automatically."
+            echo "Resolve the PR and merge it, or push the same resolution to \`master\`; the next scheduled run will resume automatically."
+            echo ""
+            echo "Conflicts in \`.github/workflows\`, \`README.md\`, \`package.json\` and \`package-lock.json\` are handled automatically. This failure means a source/config file conflicted, or the Night Light / Dark Mode feature check failed."
           } >> "$GITHUB_STEP_SUMMARY"
 
   detect-release:
