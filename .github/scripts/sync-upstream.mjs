@@ -322,6 +322,13 @@ function main() {
       '41898282+github-actions[bot]@users.noreply.github.com',
   ]);
 
+  const dirty = git(['status', '--porcelain', '--untracked-files=no']).stdout;
+  if (dirty) {
+    console.error('Working tree has uncommitted changes; refusing to sync.');
+    console.error(dirty);
+    process.exit(1);
+  }
+
   const beforeSha = git(['rev-parse', 'HEAD']).stdout;
   log(`Fork before sync: ${beforeSha}`);
 
