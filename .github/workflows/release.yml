@@ -158,7 +158,9 @@ jobs:
 
           $upstreamBody = ""
           try {
-            $upstreamBody = gh release view $env:UPSTREAM_TAG -R xanderfrangos/twinkle-tray --json body --jq .body 2>$null
+            # PowerShell returns external command output as an array of lines;
+            # join it back so the release notes keep their Markdown layout.
+            $upstreamBody = (gh release view $env:UPSTREAM_TAG -R xanderfrangos/twinkle-tray --json body --jq .body 2>$null) -join "`n"
           } catch {
             Write-Host "Could not read upstream release notes for $env:UPSTREAM_TAG; using generated notes."
           }
