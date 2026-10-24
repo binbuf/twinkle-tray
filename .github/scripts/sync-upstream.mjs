@@ -205,6 +205,8 @@ function main() {
 
   if (afterSha === beforeSha) {
     log('Already up to date; nothing to push.');
+  } else if (process.env.SYNC_SKIP_PUSH === '1') {
+    log(`SYNC_SKIP_PUSH=1; not pushing ${afterSha}.`);
   } else {
     const push = git(['push', 'origin', `HEAD:${FORK_BRANCH}`], { allowFailure: true });
     if (push.status !== 0) {
