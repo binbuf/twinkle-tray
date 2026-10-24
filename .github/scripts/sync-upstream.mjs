@@ -177,6 +177,43 @@ function verifyForkFeatures() {
   return problems;
 }
 
+function verifyForkBranding() {
+  const problems = [];
+
+  try {
+    const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+    if (!String(pkg.version || '').endsWith('-nightlightdarkmode')) {
+      problems.push(`package.json version "${pkg.version}" does not end in -nightlightdarkmode`);
+    }
+    if (pkg.author !== 'binbuf') {
+      problems.push(`package.json author is "${pkg.author}", expected "binbuf"`);
+    }
+    if (pkg.build?.appId !== 'com.binbuf.twinkle-tray') {
+      problems.push(`package.json appId is "${pkg.build?.appId}", expected "com.binbuf.twinkle-tray"`);
+    }
+    if (pkg.build?.appx?.identityName !== 'binbuf.TwinkleTray') {
+      problems.push(
+        `package.json AppX identity is "${pkg.build?.appx?.identityName}", expected "binbuf.TwinkleTray"`,
+      );
+    }
+  } catch (error) {
+    problems.push(`package.json could not be parsed: ${error.message}`);
+  }
+
+  const electronPath = 'src/electron.js';
+  if (!fs.existsSync(electronPath)) {
+    problems.push(`missing ${electronPath}`);
+  } else if (
+    !fs
+      .readFileSync(electronPath, 'utf8')
+      .includes('api.github.com/repos/binbuf/twinkle-tray/releases')
+  ) {
+    problems.push(`${electronPath} no longer points the updater at binbuf/twinkle-tray`);
+  }
+
+  return problems;
+}
+
 function openConflictPr(reasons) {
   if (process.env.SYNC_SKIP_PUSH === '1') {
     log('SYNC_SKIP_PUSH=1; skipping the conflict branch push and PR.');
@@ -445,10 +482,11 @@ function main() {
     git(['commit', '-m', 'Apply fork branding']);
   }
 
-  // Safety net: verify the fork feature still exists before touching master.
-  const featureProblems = verifyForkFeatures();
-  if (featureProblems.length) {
-    reviewReasons.push(...featureProblems.map((problem) => `Fork feature check failed: ${problem}`));
+  // Safety net: verify the fork feature and branding still exist before
+  // touching master.
+  const safetyProblems = [...verifyForkFeatures(), ...verifyForkBranding()];
+  if (safetyProblems.length) {
+    reviewReasons.push(...safetyProblems.map((problem) => `Fork safety check failed: ${problem}`));
   }
 
   const afterSha = git(['rev-parse', 'HEAD']).stdout;
