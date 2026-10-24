@@ -3,23 +3,77 @@ name: Release Build
 on:
   push:
     tags:
-      - "v*"
+      - "v*-nightlightdarkmode"
+  workflow_call:
+    inputs:
+      version:
+        description: Version without the leading v (e.g. 1.18.0-nightlightdarkmode)
+        required: true
+        type: string
+      tag:
+        description: Fork release tag (e.g. v1.18.0-nightlightdarkmode)
+        required: true
+        type: string
+      upstream_tag:
+        description: Upstream release tag to copy the notes from
+        required: false
+        type: string
+        default: ""
+      title:
+        description: Release title
+        required: false
+        type: string
+        default: ""
+      prerelease:
+        description: Mark the fork release as a prerelease
+        required: false
+        type: boolean
+        default: false
+      ref:
+        description: Commit/ref to build
+        required: false
+        type: string
+        default: ""
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version without the leading v (blank = derive from tag)
+        required: false
+        type: string
+        default: ""
+      tag:
+        description: Fork release tag (blank = current tag)
+        required: false
+        type: string
+        default: ""
+      upstream_tag:
+        description: Upstream tag to copy notes from (blank = derive)
+        required: false
+        type: string
+        default: ""
+      prerelease:
+        description: Mark as prerelease
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: true
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   release:
-    name: Build and publish installer
+    name: Build and publish fork release
     runs-on: windows-2025
 
     steps:
       - name: Read repository
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Set up Node.js 24
         uses: actions/setup-node@v6
@@ -27,35 +81,133 @@ jobs:
           node-version: 24
           cache: 'npm'
 
-      - name: Get package.json version
-        id: info
+      - name: Resolve release metadata
+        id: meta
         shell: pwsh
         run: |
-          $version = node -p "require('./package.json').version"
+          $tag = "${{ inputs.tag }}"
+          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "${{ github.ref_name }}" }
+
+          $version = "${{ inputs.version }}"
+          if ([string]::IsNullOrWhiteSpace($version)) { $version = $tag -replace '^v', '' }
+
+          if ($version -notmatch '-nightlightdarkmode$') {
+            throw "Refusing to build '$version': version must end with -nightlightdarkmode."
+          }
+
+          $upstreamTag = "${{ inputs.upstream_tag }}"
+          if ([string]::IsNullOrWhiteSpace($upstreamTag)) {
+            $upstreamTag = $version -replace '-nightlightdarkmode$', ''
+            $upstreamTag = "v$upstreamTag"
+          }
+
+          $prerelease = "${{ inputs.prerelease }}" -eq 'true'
+          if (-not $prerelease) {
+            $prerelease = $version -match '-(alpha|beta|rc|pre)'
+          }
+
+          $title = "${{ inputs.title }}"
+          if ([string]::IsNullOrWhiteSpace($title)) { $title = "Twinkle Tray v$version" }
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
+          "upstream_tag=$upstreamTag" >> $env:GITHUB_OUTPUT
+          "prerelease=$($prerelease.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          "title=$title" >> $env:GITHUB_OUTPUT
+
+          Write-Host "Release tag:      $tag"
+          Write-Host "Release version:  $version"
+          Write-Host "Upstream tag:     $upstreamTag"
+          Write-Host "Prerelease:       $prerelease"
 
       - name: Prepare dependencies
         run: npm i
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
 
       - name: Build assets
         run: npm run parcel-build
 
       - name: Build Win32 installer
-        run: npm exec electron-builder -- --x64 --config.extraMetadata.versionBuild="${{ steps.info.outputs.version }}+${{ github.sha }}" --config.win.artifactName="Twinkle.Tray.v${{ steps.info.outputs.version }}.exe" --publish="never"
+        shell: pwsh
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = "${{ steps.meta.outputs.version }}"
+          npm exec electron-builder -- --x64 --config.extraMetadata.version="$version" --config.win.artifactName="Twinkle.Tray.v$version.exe" --publish=never
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v7
         with:
-          name: twinkle-tray-exe-${{ steps.info.outputs.version }}-${{ github.sha }}
+          name: twinkle-tray-nightlightdarkmode-${{ steps.meta.outputs.version }}
           path: dist/*.exe
 
-      - name: Create GitHub release
+      - name: Publish GitHub release
         shell: pwsh
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+          UPSTREAM_TAG: ${{ steps.meta.outputs.upstream_tag }}
+          RELEASE_TITLE: ${{ steps.meta.outputs.title }}
+          RELEASE_PRERELEASE: ${{ steps.meta.outputs.prerelease }}
         run: |
-          gh release create "${{ github.ref_name }}" dist/*.exe --title "Twinkle Tray ${{ steps.info.outputs.version }}" --generate-notes
+          $repo = "${{ github.repository }}"
+          $assets = @(Get-ChildItem -Path dist -Filter *.exe | ForEach-Object { $_.FullName })
+          if ($assets.Count -eq 0) { throw "No installer was produced in dist/." }
+
+          $upstreamBody = ""
+          try {
+            $upstreamBody = gh release view $env:UPSTREAM_TAG -R xanderfrangos/twinkle-tray --json body --jq .body 2>$null
+          } catch {
+            Write-Host "Could not read upstream release notes for $env:UPSTREAM_TAG; using generated notes."
+          }
+
+          $notesFile = Join-Path $env:RUNNER_TEMP "release-notes.md"
+          $footer = @(
+            '',
+            '---',
+            '',
+            'This is an unofficial fork build of [Twinkle Tray](https://github.com/xanderfrangos/twinkle-tray) with Night Light and Dark Mode additions.',
+            '',
+            "* Upstream release: https://github.com/xanderfrangos/twinkle-tray/releases/tag/$env:UPSTREAM_TAG",
+            "* Fork source: https://github.com/$repo",
+            "* Built version: $env:RELEASE_VERSION"
+          ) -join "`n"
+
+          if ([string]::IsNullOrWhiteSpace($upstreamBody)) {
+            $body = "Fork build of Twinkle Tray $env:RELEASE_VERSION.`n$footer"
+          } else {
+            $body = "$upstreamBody`n$footer"
+          }
+          Set-Content -Path $notesFile -Value $body -Encoding utf8
+
+          $exists = $false
+          gh release view $env:RELEASE_TAG -R $repo 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) { $exists = $true }
+
+          if ($exists) {
+            Write-Host "Release $env:RELEASE_TAG already exists; updating assets and notes."
+            gh release upload $env:RELEASE_TAG $assets --clobber -R $repo
+            gh release edit $env:RELEASE_TAG -R $repo --title $env:RELEASE_TITLE --notes-file $notesFile
+            if ($env:RELEASE_PRERELEASE -eq 'true') {
+              gh release edit $env:RELEASE_TAG -R $repo --prerelease
+            }
+          } else {
+            $ghArgs = @(
+              'release', 'create', $env:RELEASE_TAG,
+              '-R', $repo,
+              '--title', $env:RELEASE_TITLE,
+              '--notes-file', $notesFile
+            )
+            if ($env:RELEASE_PRERELEASE -eq 'true') { $ghArgs += '--prerelease' }
+
+            # The scheduled mirror creates the tag along with the release. The
+            # tag-push path already has a tag, so only pass --target when the
+            # tag does not exist remotely yet.
+            $tagRefs = @(git ls-remote --tags origin "refs/tags/$env:RELEASE_TAG")
+            if ($tagRefs.Count -eq 0) { $ghArgs += @('--target', $env:GITHUB_SHA) }
+
+            $ghArgs += $assets
+            gh @ghArgs
+          }

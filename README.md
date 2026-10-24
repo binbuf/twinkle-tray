@@ -10,6 +10,10 @@
 * Night Light
 * Dark Mode
 
+### Fork release automation
+
+Upstream `master` is merged into this fork twice a day. When the upstream author publishes a release, this fork builds the same version and publishes it with `-nightlightdarkmode` appended to the tag and installer filename. For example, upstream `v1.18.0` becomes `v1.18.0-nightlightdarkmode` here.
+
 <p align="center">
   <img width="285" height="299" alt="662700018-61693e6a-2472-4329-a21c-990f19604ec0" src="https://github.com/user-attachments/assets/012422a8-512c-4581-955a-cdaaf58e7428" />
   <img width="450" alt="662700412-3a086b2a-22fa-4174-8a6f-272f2dd966c4" src="https://github.com/user-attachments/assets/06976057-41d3-4bd3-aaa7-626c20b442f5" />
