@@ -220,6 +220,16 @@ async function flushQueuedMonitorCommands(beforeRefresh = false) {
   }
 }
 
+// The monitor control a held write sets, or false for other commands
+function queuedCommandTarget(data) {
+  if (data.type === "brightness" || data.type === "sdr" || data.type === "gamma") {
+    // Internal display brightness is sent without an id
+    return `${data.type}::${data.id ?? ""}`
+  }
+  if (data.type === "vcp") return `vcp::${data.monitor}::${parseInt(data.code)}`
+  return false
+}
+
 function queuedCommandTargetsCurrentMonitor(data) {
   if (data.type === "brightness" || data.type === "sdr" || data.type === "gamma") {
     if (!data.id) return true
@@ -256,7 +266,17 @@ let monitorsThread = {
   send: function (data) {
     if (monitorCommandsThatMutateWorkerState.has(data.type) && monitorWorkerHasExclusiveWork()) {
       return new Promise((resolve, reject) => {
-        queuedMonitorCommands.push({ data, resolve, reject, generation: monitorRefreshGeneration })
+        const command = { data, resolve, reject, generation: monitorRefreshGeneration }
+        // Only the newest held value for a monitor control matters. Replace an
+        // older one in place, and resolve it so nothing waits on it forever.
+        const target = queuedCommandTarget(data)
+        const olderIndex = (target ? queuedMonitorCommands.findIndex(queued => queuedCommandTarget(queued.data) === target) : -1)
+        if (olderIndex >= 0) {
+          queuedMonitorCommands[olderIndex].resolve(true)
+          queuedMonitorCommands[olderIndex] = command
+        } else {
+          queuedMonitorCommands.push(command)
+        }
       })
     }
     return this.sendNow(data)
@@ -276,6 +296,9 @@ let monitorsThreadReal
 let monitorsEventEmitter = new EventEmitter()
 let monitorsThreadReady = false
 let monitorsThreadStarting = false
+// Startup skipped the monitor process because Windows said the user was away.
+// It starts when the screens wake instead.
+let monitorThreadStartDeferred = false
 let monitorsThreadFailed = false
 let monitorsThreadFailedResetTimer = false
 let monitorThreadRecoveryPromise = false
@@ -347,6 +370,7 @@ function startMonitorThread({ allowWhileWindowsIdle = false } = {}) {
   if((monitorsThreadReal?.connected && monitorsThreadReal?.exitCode === null) || monitorsThreadStarting || (isWindowsUserIdle && !allowWhileWindowsIdle)) return false;
   monitorsThreadReady = false
   monitorsThreadStarting = true
+  monitorThreadStartDeferred = false
   console.log("Starting monitor thread")
   const skipTest = (settings.preferredDDCCIMethod == "auto" ? false : true)
   monitorsThreadReal = fork(path.join(__dirname, 'Monitors.js'), ["--isdev=" + isDev, "--apppath=" + app.getAppPath(), "--skiptest=" + skipTest, "--datapath=" + app.getPath("userData")], { silent: true })
@@ -494,14 +518,21 @@ function recoverMonitorThread(thread, error) {
   return monitorThreadRecoveryPromise
 }
 
+// A process that has ended has an exit code, or the signal that ended it.
+// One ended by a signal has no exit code.
+function monitorThreadHasExited(thread) {
+  return thread.exitCode !== null || thread.signalCode !== null
+}
+
 function stopMonitorThread() {
   console.log("Killing monitor thread")
   monitorsThreadReady = false
   monitorsThreadStarting = false
+  activeRefresh = false
   setIsRefreshing(false)
 
   const thread = monitorsThreadReal
-  if(!thread || thread.exitCode !== null) {
+  if(!thread || monitorThreadHasExited(thread)) {
     if(monitorsThreadReal === thread) monitorsThreadReal = undefined
     return Promise.resolve()
   }
@@ -526,7 +557,7 @@ function stopMonitorThread() {
 
     try {
       if(!thread.kill()) {
-        if(thread.exitCode !== null) {
+        if(monitorThreadHasExited(thread)) {
           handleExit()
         } else {
           cleanup()
@@ -1855,9 +1886,9 @@ async function doHotkey(hotkey, options = {}) {
     for (const action of hotkey.actions) {
       try {
 
-        // Wait for refresh if user hasn't done so recently
+        // Read current brightness first if that hasn't happened recently
         if (action.type !== "refresh" && lastRefreshMonitors < Date.now() - 10000) {
-          await refreshMonitors()
+          await refreshKnownBrightness()
         }
 
         if (action.type === "off") {
@@ -2742,10 +2773,19 @@ function tryVibrancy(window, value = null) {
 
 let isRefreshing = true
 let shouldShowPanel = false
-const setIsRefreshing = newValue => {
+// Greys out the panel's sliders. Only on while the list of sliders may be
+// wrong: startup, full refreshes (which display changes start) and the
+// capabilities scans that follow them. Quick reads don't lock the sliders.
+let slidersLocked = true
+const setIsRefreshing = (newValue, lockSliders = false) => {
   isRefreshing = (newValue ? true : false)
-  sendToAllWindows("isRefreshing", isRefreshing)
+  slidersLocked = (isRefreshing && lockSliders)
+  sendToAllWindows("sliders-locked", slidersLocked)
 }
+// The refresh that turned isRefreshing on, so only it turns it off. A refresh
+// whose monitor process was stopped times out later, possibly while a newer
+// refresh is running. stopMonitorThread clears this.
+let activeRefresh = false
 
 
 refreshMonitorsJob = async (fullRefresh = false, generation = 0) => {
@@ -2785,7 +2825,9 @@ refreshMonitorsJob = async (fullRefresh = false, generation = 0) => {
   })
 }
 
-readKnownBrightnessJob = async (requestId) => {
+// Resolves { brightness, unreadable }: readings keyed by monitor id, and the
+// ids of monitors that couldn't be read
+readKnownBrightnessJob = async (requestId, options = {}) => {
   return await new Promise((resolve, reject) => {
     let cleanup = () => { }
     try {
@@ -2796,7 +2838,7 @@ readKnownBrightnessJob = async (requestId) => {
       const listener = data => {
         if (data?.requestId !== requestId) return
         cleanup()
-        resolve(data?.brightness || {})
+        resolve({ brightness: (data?.brightness || {}), unreadable: (data?.unreadable || []) })
       }
       const workerStopped = () => {
         cleanup()
@@ -2815,7 +2857,12 @@ readKnownBrightnessJob = async (requestId) => {
       monitorsEventEmitter.on("knownBrightness", listener)
       worker.once("exit", workerStopped)
       worker.once("error", workerStopped)
-      worker.send({ type: "readKnownBrightness", requestId })
+      worker.send({
+        type: "readKnownBrightness",
+        requestId,
+        readDDC: (options.readDDC ?? true),
+        includeFeatures: (options.includeFeatures ?? false)
+      })
     } catch (e) {
       cleanup()
       reject(e)
@@ -3004,7 +3051,126 @@ function clearFeaturesPendingAfterEnrichmentFailure() {
   }
 }
 
-function commitRefreshedMonitors(newMonitors, oldMonitors = {}) {
+// When the app last wrote each monitor control ("monitorId::control"). A
+// reading that started before the write can't reflect it, so it must not
+// replace the value the app set.
+const monitorControlWrites = new Map()
+const MAIN_BRIGHTNESS_CONTROLS = ["brightness", "sdr", "gamma"]
+
+// "brightness", "sdr", "gamma", or a VCP code such as "0x12"
+function monitorControlName(control) {
+  if (MAIN_BRIGHTNESS_CONTROLS.includes(control)) return control
+  if (control === "volume-raw") return "0x62"
+  return vcpStr(control)
+}
+
+function recordMonitorWrite(monitorId, control) {
+  if (!monitorId) return
+  monitorControlWrites.set(`${monitorId}::${monitorControlName(control)}`, Date.now())
+}
+
+// A write held back during exclusive monitor work hasn't reached the monitor
+// yet, however long ago it was made.
+function hasQueuedMonitorWrite(monitor, control) {
+  return queuedMonitorCommands.some(({ data }) => {
+    if (data.type === "vcp") {
+      return data.monitor === monitor.hwid?.join("#") && vcpStr(data.code) === control
+    }
+    if (!MAIN_BRIGHTNESS_CONTROLS.includes(data.type)) return false
+    // Internal display brightness is sent without an id
+    const sameMonitor = (data.id ? data.id === monitor.id : monitor.type === "wmi")
+    // The gamma ramp also carries brightness for extended minimum displays
+    return sameMonitor && (data.type === control || (data.type === "gamma" && control === "brightness"))
+  })
+}
+
+function wasWrittenSince(monitor, control, readStartedAt) {
+  if (!monitor?.id || !readStartedAt) return false
+  const name = monitorControlName(control)
+  return (monitorControlWrites.get(`${monitor.id}::${name}`) >= readStartedAt || hasQueuedMonitorWrite(monitor, name))
+}
+
+// Was the main slider's value written since the read started?
+function wasBrightnessWrittenSince(monitor, readStartedAt) {
+  return MAIN_BRIGHTNESS_CONTROLS.some(control => wasWrittenSince(monitor, control, readStartedAt))
+}
+
+// Turn a reading's hardware brightness into the slider level the app works
+// with. When the app wrote brightness since the read started, keep the app's
+// values instead, so an older reading never replaces a newer change.
+function settleBrightnessReading(monitor, current, readStartedAt) {
+  const keepCurrent = (current?.id === monitor.id && wasBrightnessWrittenSince(current, readStartedAt))
+
+  monitor.brightness = normalizeBrightness(monitor.brightness, true, monitor.min, monitor.max, monitor.calibration)
+
+  // Replace DDC/CI brightness with SDR
+  if(settings.sdrAsMainSliderDisplays?.[monitor.key] && monitor.hdr === "active") {
+    monitor.brightness = monitor.sdrLevel
+  }
+
+  // Replace detected brightness with the gamma ramp level
+  if(usesGammaSlider(monitor)) {
+    monitor.brightness = normalizeBrightness(gammaLevelToSliderLevel(monitor.gammaBrightness), true, monitor.min, monitor.max, monitor.calibration)
+    monitor.brightnessRaw = monitor.gammaBrightness
+  }
+
+  // Fold the gamma ramp into the bottom of the slider range. An outdated
+  // reading must not release a ramp the app just set.
+  if(usesExtendedMinimum(monitor)) {
+    if (!keepCurrent) releaseExtendedMinimumRamp(monitor, monitor.brightness)
+    monitor.brightness = getExtendedMinimumLevel(monitor, monitor.brightness)
+  }
+
+  if (keepCurrent) {
+    for (const field of ["brightness", "brightnessRaw", "gammaBrightness", "sdrLevel"]) {
+      if (current[field] !== undefined) monitor[field] = current[field]
+    }
+  }
+  return keepCurrent
+}
+
+// Turn a reading's DDC/CI feature values into the values the app works with,
+// keeping any the app wrote since the read started. Those are stored like a
+// reading, so they're normalized like one.
+function settleFeatureReadings(monitor, current, readStartedAt) {
+  const featuresSettings = settings.monitorFeaturesSettings?.[monitor.hwid?.[1]]
+  for(const vcp in monitor.features) {
+    if (!Array.isArray(monitor.features[vcp])) continue
+    if (current?.id === monitor.id && Array.isArray(current.features?.[vcp])
+      && wasWrittenSince(current, vcp, readStartedAt)) {
+      monitor.features[vcp][0] = current.features[vcp][0]
+    }
+    if(featuresSettings && vcp !== "0x62" && featuresSettings[vcp] && featuresSettings[vcp].min >= 0 && featuresSettings[vcp].max <= 100) {
+      monitor.features[vcp][0] = normalizeBrightness(monitor.features[vcp][0], true, featuresSettings[vcp].min, featuresSettings[vcp].max)
+    }
+  }
+}
+
+// Save a brightness-only read (readKnownBrightness) onto the known monitors.
+// It goes through the same conversion as a refresh, including min/max and
+// calibration, which this read used to skip for plain DDC/CI monitors.
+function applyKnownBrightness(knownBrightness, readStartedAt) {
+  for (const monitor of Object.values(monitors)) {
+    const known = knownBrightness?.[monitor.id]
+    if (!known) continue
+    const reading = Object.assign({}, monitor, known)
+    settleBrightnessReading(reading, monitor, readStartedAt)
+    for (const field of ["brightness", "brightnessRaw", "brightnessMax", "gammaBrightness", "sdrLevel", "hdr"]) {
+      if (reading[field] !== undefined) monitor[field] = reading[field]
+    }
+    // Feature values, when the read included them
+    if (known.features && monitor.features) {
+      settleFeatureReadings(reading, monitor, readStartedAt)
+      for (const vcp in reading.features) {
+        if (monitor.features[vcp] !== undefined && Array.isArray(reading.features[vcp])) {
+          monitor.features[vcp] = reading.features[vcp]
+        }
+      }
+    }
+  }
+}
+
+function commitRefreshedMonitors(newMonitors, oldMonitors = {}, readStartedAt = 0) {
   applyOrder(newMonitors)
   applyRemaps(newMonitors)
   applyHotkeys(newMonitors)
@@ -3012,35 +3178,11 @@ function commitRefreshedMonitors(newMonitors, oldMonitors = {}) {
   // Normalize values
   for (let id in newMonitors) {
     const monitor = newMonitors[id]
+    const current = monitors[id]
     restoreGammaAfterReset(monitor, oldMonitors[id])
-    monitor.brightness = normalizeBrightness(monitor.brightness, true, monitor.min, monitor.max, monitor.calibration)
+    settleBrightnessReading(monitor, current, readStartedAt)
 
-    // Replace DDC/CI brightness with SDR
-    if(settings.sdrAsMainSliderDisplays?.[monitor.key] && monitor.hdr === "active") {
-      monitor.brightness = monitor.sdrLevel
-    }
-
-    // Replace detected brightness with the gamma ramp level
-    if(usesGammaSlider(monitor)) {
-      monitor.brightness = normalizeBrightness(gammaLevelToSliderLevel(monitor.gammaBrightness), true, monitor.min, monitor.max, monitor.calibration)
-      monitor.brightnessRaw = monitor.gammaBrightness
-    }
-
-    // Fold the gamma ramp into the bottom of the slider range
-    if(usesExtendedMinimum(monitor)) {
-      releaseExtendedMinimumRamp(monitor, monitor.brightness)
-      monitor.brightness = getExtendedMinimumLevel(monitor, monitor.brightness)
-    }
-
-    // Other DDC/CI normalizations
-    const featuresSettings = settings.monitorFeaturesSettings?.[monitor.hwid[1]]
-    if(featuresSettings) {
-      for(const vcp in monitor.features) {
-        if(vcp !== "0x62" && featuresSettings[vcp] && featuresSettings[vcp].min >= 0 && featuresSettings[vcp].max <= 100) {
-          monitor.features[vcp][0] = normalizeBrightness(monitor.features[vcp][0], true, featuresSettings[vcp].min, featuresSettings[vcp].max)
-        }
-      }
-    }
+    settleFeatureReadings(monitor, current, readStartedAt)
   }
 
   monitors = newMonitors
@@ -3079,6 +3221,8 @@ function queueCapabilitiesEnrichment(generation) {
   if (activeCapabilitiesEnrichmentPromise) return activeCapabilitiesEnrichmentPromise
   activeCapabilitiesEnrichment = generation
 
+  // Enrichment reads brightness again, so it's a reading like any refresh
+  const readStartedAt = Date.now()
   let enrichmentPromise
   enrichmentPromise = enrichMonitorCapabilitiesJob(generation).then(data => {
     if (data?.generation !== generation || generation !== monitorRefreshGeneration) {
@@ -3092,7 +3236,15 @@ function queueCapabilitiesEnrichment(generation) {
     }
 
     const oldMonitors = Object.assign({}, monitors)
-    commitRefreshedMonitors(data.monitors, oldMonitors)
+    try {
+      commitRefreshedMonitors(data.monitors, oldMonitors, readStartedAt)
+    } catch (e) {
+      // The monitor process did its part. Keep this out of the catch below,
+      // which restarts the process and scans again, so a save that keeps
+      // failing can't loop.
+      console.log("Couldn't save the capabilities scan results.", e)
+      clearFeaturesPendingAfterEnrichmentFailure()
+    }
   }).catch(async error => {
     console.log("Couldn't enrich monitor capabilities", error)
     if (error?.code === "MONITOR_WORKER_STOPPED") {
@@ -3168,56 +3320,71 @@ async function refreshMonitors(fullRefresh = false, bypassRateLimit = false, byp
     console.log("\x1b[34m---------------------------------------------- \x1b[0m")
     return monitors;
   }
-  setIsRefreshing(true)
-
-  // Reset all known displays
-  if (fullRefresh) {
-    console.log("Doing full refresh.")
-  }
-
-  // Save old monitors for comparison
-  let oldMonitors = Object.assign({}, monitors)
-  let newMonitors
-  let canEnrichCapabilities = false
-  const generation = (reservedGeneration || ++monitorRefreshGeneration)
-
-  let failed = false
+  const refreshToken = {}
+  activeRefresh = refreshToken
+  let handedToEnrichment = false
+  // Everything from turning isRefreshing on is in this try, so an error can't
+  // leave it on. That would hold back every later refresh and brightness change.
   try {
-    const result = await refreshMonitorsJob(fullRefresh, generation)
-    newMonitors = result?.monitors
-    canEnrichCapabilities = !!result?.canEnrichCapabilities
-    if (!newMonitors) {
-      failed = true;
-      throw "No monitors recieved!";
+    setIsRefreshing(true, fullRefresh)
+
+    // Reset all known displays
+    if (fullRefresh) {
+      console.log("Doing full refresh.")
     }
-    if (generation !== monitorRefreshGeneration) {
-      console.log("Discarding a superseded monitor refresh.")
+
+    // Save old monitors for comparison
+    let oldMonitors = Object.assign({}, monitors)
+    let newMonitors
+    let canEnrichCapabilities = false
+    const generation = (reservedGeneration || ++monitorRefreshGeneration)
+
+    let failed = false
+    const readStartedAt = Date.now()
+    try {
+      const result = await refreshMonitorsJob(fullRefresh, generation)
+      newMonitors = result?.monitors
+      canEnrichCapabilities = !!result?.canEnrichCapabilities
+      if (!newMonitors) {
+        failed = true;
+        throw "No monitors recieved!";
+      }
+      if (generation !== monitorRefreshGeneration) {
+        console.log("Discarding a superseded monitor refresh.")
+        failed = true
+      } else {
+        lastEagerUpdate = Date.now()
+      }
+    } catch (e) {
       failed = true
-    } else {
-      lastEagerUpdate = Date.now()
+      console.log('Couldn\'t refresh monitors', e)
+    }
+
+    if (!failed) {
+      commitRefreshedMonitors(newMonitors, oldMonitors, readStartedAt)
+    }
+
+    if (shouldShowPanel) {
+      shouldShowPanel = false
+      setTimeout(() => toggleTray(true), 333)
+    }
+
+    console.log("\x1b[34m---------------------------------------------- \x1b[0m")
+    if (!failed && canEnrichCapabilities) {
+      const enrichmentPromise = queueCapabilitiesEnrichment(generation)
+      // The capabilities scan turns isRefreshing off when it ends
+      handedToEnrichment = true
+      if (waitForFeatureEnrichment) await enrichmentPromise
     }
   } catch (e) {
-    failed = true
-    console.log('Couldn\'t refresh monitors', e)
+    console.log("Monitor refresh failed.", e)
+  } finally {
+    if (activeRefresh === refreshToken) {
+      activeRefresh = false
+      if (!handedToEnrichment) setIsRefreshing(false)
+    }
+    flushQueuedMonitorCommands()
   }
-
-  if (!failed) {
-    commitRefreshedMonitors(newMonitors, oldMonitors)
-  }
-
-  if (shouldShowPanel) {
-    shouldShowPanel = false
-    setTimeout(() => toggleTray(true), 333)
-  }
-
-  console.log("\x1b[34m---------------------------------------------- \x1b[0m")
-  if (!failed && canEnrichCapabilities) {
-    const enrichmentPromise = queueCapabilitiesEnrichment(generation)
-    if (waitForFeatureEnrichment) await enrichmentPromise
-  } else {
-    setIsRefreshing(false)
-  }
-  flushQueuedMonitorCommands()
   return monitors;
 }
 
@@ -3292,6 +3459,9 @@ function updateBrightnessThrottle(id, level, useCap = true, sendUpdate = true, v
     if (sendUpdate) sendToAllWindows('monitors-updated', monitors);
     return true
   }
+
+  // A held write is already the newest value, even before it's sent
+  recordMonitorWrite(id, vcpKey)
 
   // Keep only the latest level, but still notify windows if any skipped update asked to
   state.pending = { id, level, useCap, vcp, sendUpdate: (sendUpdate || state.pending?.sendUpdate) }
@@ -3421,6 +3591,9 @@ function updateBrightness(index, newLevel, useCap = true, vcpValue = "brightness
       console.log(`\x1b[31mSkipping monitor ${monitor.id} due to rules list\x1b[0m`)
       return false
     }
+
+    // From here the app's value is the newest one for this control
+    recordMonitorWrite(monitor.id, (rawVolume ? "volume-raw" : vcp))
 
     // Split the slider range: above the breakpoint drives hardware brightness,
     // below it pins hardware at its minimum and dims with the gamma ramp.
@@ -3856,8 +4029,8 @@ ipcMain.on('flush-vcp-cache', function (event) {
   })
 })
 
-ipcMain.on('get-refreshing', () => {
-  sendToAllWindows('isRefreshing', isRefreshing)
+ipcMain.on('get-sliders-locked', () => {
+  sendToAllWindows('sliders-locked', slidersLocked)
 })
 
 ipcMain.on('open-settings', createSettings)
@@ -3984,7 +4157,7 @@ ipcMain.on('save-report', async () => {
 let panelState = "hidden"
 let panelReady = false
 
-function createPanel(toggleOnLoad = false, isRefreshing = false, showOnLoad = true) {
+function createPanel(toggleOnLoad = false, startLocked = false, showOnLoad = true) {
 
   console.log("Creating panel...")
 
@@ -4023,7 +4196,7 @@ function createPanel(toggleOnLoad = false, isRefreshing = false, showOnLoad = tr
         appVersion: appVersion,
         appVersionTag: appVersionTag,
         appBuild: appBuildShort,
-        isRefreshing: isRefreshing
+        slidersLocked: startLocked
       })).toString('base64')],
       allowRunningInsecureContent: true,
       webSecurity: false
@@ -4145,6 +4318,7 @@ function createPanel(toggleOnLoad = false, isRefreshing = false, showOnLoad = tr
         if(isWindowsUserIdle) {
           isWindowsUserIdle = false
           console.log("Displays have woken up.")
+          if(monitorThreadStartDeferred) startMonitorThread();
           recentlyWokeUp = true
           handleMetricsChange("GUID_SESSION_USER_PRESENCE")
           if(!resumeRecoveryInProgress) clearRecentlyWokeUpLater()
@@ -4738,7 +4912,13 @@ app.on("ready", async () => {
   createPanel(false, true)
 
   await doWMIBridgeTest()
-  startMonitorThread()
+  // Windows may already say the user is away, so the monitors may be off. The
+  // power event handler starts the process when the screens wake, and the
+  // startup steps below run once it's ready.
+  if (!startMonitorThread() && isWindowsUserIdle) {
+    console.log("Displays are off. Starting the monitor thread when they wake.")
+    monitorThreadStartDeferred = true
+  }
   monitorsThread.once("ready", async () => {
 
     monitorsThread.send({
@@ -4787,7 +4967,7 @@ app.on('quit', () => {
     BrightnessKeys.unregister()
     nativeBrightnessKeysRegistered = false
     stopNativeBrightnessKeyRepeat()
-    tray.destroy()
+    tray?.destroy()
   } catch (e) {
 
   }
@@ -4941,8 +5121,65 @@ function tryEagerUpdate(forceRefresh = true) {
   const now = Date.now()
   if (now > lastEagerUpdate + 5000) {
     lastEagerUpdate = now
-    refreshMonitors(forceRefresh, true)
+    if (forceRefresh) {
+      refreshMonitors(true, true)
+    } else {
+      refreshKnownBrightness()
+    }
   }
+}
+
+// A light read for flyout opens and hotkeys: the current brightness of the
+// displays already known, plus the DDC/CI features shown in the flyout. It
+// skips the DDC/CI rescan and doesn't hold back changes while it runs. If a
+// monitor can't be read, it falls back once to a normal quick refresh, which
+// rescans displays.
+let knownBrightnessReadPromise = false
+function refreshKnownBrightness() {
+  // Only refreshes and the capabilities scans after them lock the sliders. If
+  // none is running, the lock was left on by mistake.
+  if (slidersLocked && !monitorWorkerHasExclusiveWork()) {
+    if (!lastCompletedRefresh) {
+      // The displays aren't known yet. A full refresh keeps "Detecting
+      // displays..." on screen until it ends, where a quick one would show
+      // "No compatible displays" while it runs.
+      console.log("Sliders were locked before any refresh finished. Running a full refresh.")
+      return refreshMonitors(true, true, true)
+    }
+    console.log("Sliders were locked with no refresh running. Unlocking.")
+    setIsRefreshing(false)
+  }
+  if (knownBrightnessReadPromise) return knownBrightnessReadPromise
+  // A running refresh or capabilities scan delivers fresh values itself
+  if (isWindowsUserIdle || !monitorsThreadReady || pausedMonitorUpdates || monitorWorkerHasExclusiveWork()) {
+    return Promise.resolve(monitors)
+  }
+
+  lastRefreshMonitors = Date.now()
+  const readStartedAt = Date.now()
+  const requestId = `${Date.now()}-${Math.random()}`
+  knownBrightnessReadPromise = readKnownBrightnessJob(requestId, {
+    readDDC: !!settings.getDDCBrightnessUpdates,
+    includeFeatures: "shown"
+  }).then(async ({ brightness, unreadable }) => {
+    const before = JSON.stringify(monitors)
+    applyKnownBrightness(brightness, readStartedAt)
+    if (JSON.stringify(monitors) !== before) {
+      setTrayPercent()
+      sendToAllWindows('monitors-updated', monitors)
+    }
+    if (unreadable.length) {
+      console.log(`Couldn't read brightness for ${unreadable.join(", ")}. Falling back to a quick refresh.`)
+      await refreshMonitors(false, true)
+    }
+  }).catch(async error => {
+    console.log("Couldn't read known brightness. Falling back to a quick refresh.", error)
+    await refreshMonitors(false, true)
+  }).then(() => {
+    knownBrightnessReadPromise = false
+    return monitors
+  })
+  return knownBrightnessReadPromise
 }
 
 function quitApp() {
@@ -5626,8 +5863,7 @@ powerMonitor.on("resume", async () => {
   setRecentlyInteracted(false)
   
   if(settings.restartOnWake) {
-  // Screw it, just restart the whole app.
-    tray.destroy()
+    // The quit handler cleans up the tray icon if it exists.
     app.relaunch()
     app.exit()
     return
@@ -6082,24 +6318,10 @@ function applyCurrentAdjustmentEvent(force = false, instant = true) {
 
         if (settings.adjustmentTimeAnimate) {
           const requestId = `${Date.now()}-${Math.random()}`
+          const readStartedAt = Date.now()
           readKnownBrightnessJob(requestId)
-            .then(knownBrightness => {
-              for (const monitor of Object.values(monitors)) {
-                const current = knownBrightness[monitor.id]
-                if (!current) continue
-                Object.assign(monitor, current)
-                if (settings.sdrAsMainSliderDisplays?.[monitor.key] && monitor.hdr === "active") {
-                  monitor.brightness = monitor.sdrLevel
-                }
-                if (usesGammaSlider(monitor)) {
-                  monitor.brightness = normalizeBrightness(gammaLevelToSliderLevel(monitor.gammaBrightness), true, monitor.min, monitor.max, monitor.calibration)
-                }
-                if (usesExtendedMinimum(monitor)) {
-                  const hardwareLevel = normalizeBrightness(monitor.brightness, true, monitor.min, monitor.max, monitor.calibration)
-                  releaseExtendedMinimumRamp(monitor, hardwareLevel)
-                  monitor.brightness = getExtendedMinimumLevel(monitor, hardwareLevel)
-                }
-              }
+            .then(({ brightness: knownBrightness }) => {
+              applyKnownBrightness(knownBrightness, readStartedAt)
               applyAdjustment(new Set(Object.keys(knownBrightness)))
             })
             .catch(error => console.log("Couldn't read known brightness for animated adjustment.", error))

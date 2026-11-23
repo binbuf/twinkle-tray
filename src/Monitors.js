@@ -191,10 +191,14 @@ async function handleMonitorMessage(data) {
                 canEnrichCapabilities: !!(data.fullRefresh && shouldEnrichCapabilities())
             })
         } else if (data.type === "readKnownBrightness") {
-            const brightness = await readKnownBrightness()
+            const { brightness, unreadable } = await readKnownBrightness({
+                readDDC: data.readDDC,
+                includeFeatures: data.includeFeatures
+            })
             process.send({
                 type: 'knownBrightness',
                 brightness,
+                unreadable,
                 requestId: data.requestId
             })
         } else if (data.type === "enrichMonitorCapabilities") {
@@ -536,6 +540,11 @@ function invalidateFeatureSnapshots(monitorIds) {
     }
 }
 
+// Milliseconds since a process.hrtime.bigint() start time, keeping whole seconds
+function elapsedMS(startTime) {
+    return Number(process.hrtime.bigint() - startTime) / 1000000
+}
+
 let busyLevel = 0
 refreshMonitors = async (fullRefresh = false, ddcciType = "default", alwaysSendUpdate = false) => {
     try {
@@ -555,26 +564,30 @@ refreshMonitors = async (fullRefresh = false, ddcciType = "default", alwaysSendU
             if (useCapabilityEnrichment) applyFeatureSnapshots(foundMonitors)
             monitors = foundMonitors
         } else {
-            let startTime = process.hrtime()
+            let startTime = process.hrtime.bigint()
 
             // DDC/CI
             try {
                 if (settings?.getDDCBrightnessUpdates) {
                     if(!getDDCCI()) {
+                        const rescanStart = process.hrtime.bigint()
                         ddcci._refresh(
                             (shouldEnrichCapabilities() ? "fast" : determineDDCCIMethod()),
                             true,
                             !settings.disableHighLevel,
                             getDDCBlockedKeys()
                         )
+                        console.log(`DDC/CI rescan: ${elapsedMS(rescanStart)}ms`)
                     }
                     for (const hwid2 in monitors) {
                         if (monitors[hwid2].type === "ddcci" && monitors[hwid2].brightnessType) {
+                            const monitorStart = process.hrtime.bigint()
                             const monitor = await getBrightnessDDC(monitors[hwid2])
                             monitors[hwid2] = monitor
+                            console.log(`getBrightnessDDC(${hwid2}): ${elapsedMS(monitorStart)}ms`)
                         }
                     }
-                    console.log(`getBrightnessDDC() Total: ${process.hrtime(startTime)[1] / 1000000}ms`)
+                    console.log(`getBrightnessDDC() Total: ${elapsedMS(startTime)}ms`)
                 }
             } catch (e) {
                 console.log("\x1b[41m" + "getBrightnessDDC() failed!" + "\x1b[0m", e)
@@ -637,24 +650,32 @@ refreshMonitors = async (fullRefresh = false, ddcciType = "default", alwaysSendU
     return monitors
 }
 
-// Read only the values needed to accurately apply an animated time adjustment.
-// This deliberately avoids rediscovering displays, scanning capabilities, or
-// refreshing feature values. Those operations remain the responsibility of a
-// normal monitor refresh.
-async function readKnownBrightness() {
-    if (!monitors) return {}
+// Read the current brightness of the displays already known, for animated
+// time adjustments, flyout opens and hotkeys. This deliberately avoids
+// rediscovering displays and scanning capabilities. Those remain the
+// responsibility of a normal monitor refresh.
+//   readDDC: read DDC/CI monitors (callers pass the "Get current brightness" setting)
+//   includeFeatures: "shown" also reads the DDC/CI features shown in the flyout
+// Monitors that couldn't be read are reported, instead of falling back to old values.
+async function readKnownBrightness({ readDDC = true, includeFeatures = false } = {}) {
+    if (!monitors) return { brightness: {}, unreadable: [] }
 
+    const startTime = process.hrtime.bigint()
     const result = {}
     const unreadableMonitorIds = new Set()
+    const monitorsWithFeatures = new Set()
 
     try {
         for (const hwid2 in monitors) {
             const monitor = monitors[hwid2]
-            if (monitor.type !== "ddcci" || !monitor.brightnessType) continue
+            if (!readDDC || monitor.type !== "ddcci" || !monitor.brightnessType) continue
 
-            const refreshedMonitor = await getBrightnessDDC(monitor, false, true)
+            const monitorStart = process.hrtime.bigint()
+            const refreshedMonitor = await getBrightnessDDC(monitor, includeFeatures, true)
+            console.log(`readKnownBrightness DDC/CI (${hwid2}): ${elapsedMS(monitorStart)}ms`)
             if (!refreshedMonitor.brightnessReadFailed) {
                 monitors[hwid2] = refreshedMonitor
+                if (includeFeatures) monitorsWithFeatures.add(refreshedMonitor.id)
             } else {
                 unreadableMonitorIds.add(monitor.id)
             }
@@ -714,9 +735,13 @@ async function readKnownBrightness() {
             sdrLevel: monitor.sdrLevel,
             hdr: monitor.hdr
         }
+        if (monitorsWithFeatures.has(monitor.id) && monitor.features) {
+            result[monitor.id].features = monitor.features
+        }
     }
 
-    return result
+    console.log(`readKnownBrightness() Total: ${elapsedMS(startTime)}ms${unreadableMonitorIds.size ? `, unreadable: ${[...unreadableMonitorIds].join(", ")}` : ""}`)
+    return { brightness: result, unreadable: [...unreadableMonitorIds] }
 }
 
 // Accurate and Auto scans publish a usable Fast result before requesting
@@ -1677,12 +1702,17 @@ getBrightnessDDC = (monitorObj, includeFeatures = true, reportReadFailure = fals
             // Unnormalize brightness
             monitor.brightness = normalizeBrightness(monitor.brightness, true, monitor.min, monitor.max)
 
-            // Get custom DDC/CI features
+            // Get custom DDC/CI features. "shown" skips linked features,
+            // which follow brightness and aren't shown in the flyout.
             const settingsFeatures = settings?.monitorFeatures?.[monitor.hwid[1]]
+            const featuresSettings = settings?.monitorFeaturesSettings?.[monitor.hwid[1]]
             if(includeFeatures && settingsFeatures) {
                 for(const vcp in settingsFeatures) {
                     if(vcp == monitor.brightnessType) {
                         continue; // Skip brightness
+                    }
+                    if(includeFeatures === "shown" && featuresSettings?.[vcp]?.linked) {
+                        continue;
                     }
                     if(settingsFeatures[vcp]) {
                         monitor.features[vcpStr(vcp)] = await checkVCP(monitor.id, parseInt(vcp))
