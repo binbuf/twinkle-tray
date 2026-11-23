@@ -18,6 +18,7 @@ const BrightnessPanel = memo(function BrightnessPanel() {
     update: false,
     sleeping: false,
     updateProgress: 0,
+<<<<<<< HEAD
     isRefreshing: window.isRefreshing,
     // null until Windows Night Light status is known (or unsupported)
     nightLight: null,
@@ -28,11 +29,21 @@ const BrightnessPanel = memo(function BrightnessPanel() {
     nightLightKnown: false,
     darkMode: false,
     darkModeMode: "light"
+=======
+    slidersLocked: window.slidersLocked
+>>>>>>> upstream/master
   })
   const [doBackgroundEvent, setDoBackgroundEvent] = useState(false)
   const [levelsChanged, setLevelsChanged] = useState(false)
   const [init, setInit] = useState(false)
-  const [lastLevels, setLastLevels] = useState([])
+  // Monitors whose level the user changed since the last send. Only these are
+  // sent, so opening the panel never writes old values back to every monitor.
+  const changedMonitors = useRef(new Set())
+  // Remaps from the last settings update, to spot a monitor whose limits changed
+  const lastRemaps = useRef(null)
+  // Monitors the user is adjusting, with the level they set and when that
+  // stops counting. New monitor data doesn't move these sliders.
+  const sliderInUse = useRef({})
   const [T] = useState(new TranslateReact({}, {}))
   const [, setLocalizationVersion] = useState(0)
 
@@ -56,6 +67,15 @@ const BrightnessPanel = memo(function BrightnessPanel() {
     })
   }
 
+  // A slider stays the user's for this long after their last input
+  const SLIDER_IN_USE_MS = 1000
+
+  const markSliderInUse = (key, level) => {
+    sliderInUse.current[key] = { level, until: Date.now() + SLIDER_IN_USE_MS }
+  }
+
+  const isSliderInUse = (key) => (sliderInUse.current[key]?.until > Date.now())
+
   // Handle <Slider> changes
   const handleChange = (level, slider) => {
     const monitors = { ...state.monitors }
@@ -65,13 +85,19 @@ const BrightnessPanel = memo(function BrightnessPanel() {
       for (let key in monitors) {
         const monitor = monitors[key]
         monitor.brightness = level
+        changedMonitors.current.add(key)
+        markSliderInUse(key, level)
       }
       setState(prev => ({ ...prev, monitors }))
       setLevelsChanged(true)
       if (state.updateInterval === 999) syncBrightness()
     } else if (numMonitors > 0) {
       // Update single monitor
-      if (sliderMonitor) sliderMonitor.brightness = level;
+      if (sliderMonitor) {
+        sliderMonitor.brightness = level
+        changedMonitors.current.add(slider.props.hwid)
+        markSliderInUse(slider.props.hwid, level)
+      }
       setState(prev => ({ ...prev, monitors }))
       setLevelsChanged(true)
       if (state.updateInterval === 999) syncBrightness()
@@ -82,7 +108,13 @@ const BrightnessPanel = memo(function BrightnessPanel() {
   // Update monitor info
   const recievedMonitors = (e) => {
     let newMonitors = { ...e.detail }
-    setLastLevels([])
+    // New data can be behind the slider the user is moving (it was sent up
+    // to one update interval ago), so keep their level for those monitors.
+    for (const key in newMonitors) {
+      if (isSliderInUse(key) && newMonitors[key]) {
+        newMonitors[key] = { ...newMonitors[key], brightness: sliderInUse.current[key].level }
+      }
+    }
     // Reset panel height so it's recalculated
     panelHeight = -1
     setState(prev => ({
@@ -93,27 +125,30 @@ const BrightnessPanel = memo(function BrightnessPanel() {
     if (!init) setTimeout(() => { setInit(true) }, 333)
   }
 
-  const updateMinMax = (inMonitors = false) => {
-    if (numMonitors > 0) {
-      let newMonitors = Object.assign((inMonitors ? inMonitors : state.monitors), {})
-      for (let key in newMonitors) {
-        for (let remap in state.remaps) {
-          if (newMonitors[key].name == remap) {
-            newMonitors[key].min = state.remaps[remap].min
-            newMonitors[key].max = state.remaps[remap].max
-          }
-        }
+  // The remap that applies to a monitor, matched the same way as the main process
+  const getRemap = (remaps, monitor) => {
+    if (!remaps || !monitor) return undefined
+    return remaps[monitor.id] ?? remaps[monitor.name]
+  }
+
+  // Re-send a monitor's level when its min/max remap changed, so the new
+  // limits are applied to it. Other settings changes don't send anything.
+  const updateMinMax = (remaps) => {
+    const previous = lastRemaps.current
+    lastRemaps.current = remaps
+    if (!previous) return
+    let changed = false
+    const monitors = window.allMonitors || {}
+    for (const key in monitors) {
+      const monitor = monitors[key]
+      if (JSON.stringify(getRemap(previous, monitor)) !== JSON.stringify(getRemap(remaps, monitor))) {
+        changedMonitors.current.add(key)
+        changed = true
       }
+    }
+    if (changed) {
       setLevelsChanged(true)
-      if (inMonitors) {
-        return inMonitors
-      } else {
-        setState(prev => ({
-          ...prev,
-          monitors: newMonitors
-        }))
-        setDoBackgroundEvent(true)
-      }
+      setDoBackgroundEvent(true)
     }
   }
 
@@ -126,7 +161,6 @@ const BrightnessPanel = memo(function BrightnessPanel() {
     const remaps = (settings.remaps || {})
     const names = (settings.names || {})
     const hideDisplays = (settings.hideDisplays || {})
-    setLevelsChanged(true)
     setState(prev => ({
       ...prev,
       linkedLevelsActive,
@@ -136,9 +170,7 @@ const BrightnessPanel = memo(function BrightnessPanel() {
       updateInterval,
       sleepAction
     }))
-    resetBrightnessInterval()
-    updateMinMax()
-    setDoBackgroundEvent(true)
+    updateMinMax(remaps)
   }
 
   const recievedUpdate = (e) => {
@@ -158,9 +190,11 @@ const BrightnessPanel = memo(function BrightnessPanel() {
     if (init && levelsChanged && (window.showPanel || doBackgroundEvent) && numMonitors) {
       setDoBackgroundEvent(false)
       setLevelsChanged(false)
+      const changed = changedMonitors.current
+      changedMonitors.current = new Set()
       try {
         for (let idx in monitors) {
-          if (isAdjustableDisplay(monitors[idx]) && monitors[idx].brightness != lastLevels[idx]) {
+          if (changed.has(idx) && isAdjustableDisplay(monitors[idx])) {
             window.updateBrightness(monitors[idx].id, monitors[idx].brightness)
           }
         }
@@ -175,7 +209,7 @@ const BrightnessPanel = memo(function BrightnessPanel() {
     updateInterval = setInterval(() => syncBrightness(), (state.updateInterval || 500))
   }
 
-  const handleIsRefreshingUpdate = (e) => setState(prev => ({ ...prev, isRefreshing: e.detail }))
+  const handleSlidersLockedUpdate = (e) => setState(prev => ({ ...prev, slidersLocked: e.detail }))
   const handleUpdateProgress = (e) => setState(prev => ({ ...prev, updateProgress: e.detail.progress }))
 
   // Night Light is a global blue-light filter stored by Windows. The 0-100
@@ -339,7 +373,7 @@ const BrightnessPanel = memo(function BrightnessPanel() {
     return () => {
       clearInterval(updateInterval)
     }
-  }, [state.monitors, numMonitors, doBackgroundEvent, levelsChanged, init])
+  }, [state.monitors, state.updateInterval, numMonitors, doBackgroundEvent, levelsChanged, init])
 
 
   useEffect(() => {
@@ -351,7 +385,7 @@ const BrightnessPanel = memo(function BrightnessPanel() {
     }
     const handleUpdateUpdated = (e) => recievedUpdate(e)
     const handleSleepUpdated = (e) => recievedSleep(e)
-    const handleRefreshingUpdated = (e) => handleIsRefreshingUpdate(e)
+    const handleSlidersLockedUpdated = (e) => handleSlidersLockedUpdate(e)
     const handleProgressUpdated = (e) => handleUpdateProgress(e)
     const handleNightLightUpdated = (e) => recievedNightLight(e)
     const handleDarkModeUpdated = (e) => recievedDarkMode(e)
@@ -361,13 +395,21 @@ const BrightnessPanel = memo(function BrightnessPanel() {
     window.addEventListener("localizationUpdated", handleLocalizationUpdated)
     window.addEventListener("updateUpdated", handleUpdateUpdated)
     window.addEventListener("sleepUpdated", handleSleepUpdated)
+<<<<<<< HEAD
     window.addEventListener("isRefreshing", handleRefreshingUpdated)
     window.addEventListener("nightLightUpdated", handleNightLightUpdated)
     window.addEventListener("darkModeUpdated", handleDarkModeUpdated)
+=======
+    window.addEventListener("slidersLocked", handleSlidersLockedUpdated)
+>>>>>>> upstream/master
 
     if (window.isAppX === false) {
       window.addEventListener("updateProgress", handleProgressUpdated)
     }
+
+    // The lock can change between the first draw and adding the listener
+    // above. The preload always keeps window.slidersLocked current.
+    setState(prev => (prev.slidersLocked === window.slidersLocked ? prev : { ...prev, slidersLocked: window.slidersLocked }))
 
     // Update brightness every interval, if changed
     window.requestSettings()
@@ -383,7 +425,7 @@ const BrightnessPanel = memo(function BrightnessPanel() {
       window.removeEventListener("localizationUpdated", handleLocalizationUpdated)
       window.removeEventListener("updateUpdated", handleUpdateUpdated)
       window.removeEventListener("sleepUpdated", handleSleepUpdated)
-      window.removeEventListener("isRefreshing", handleRefreshingUpdated)
+      window.removeEventListener("slidersLocked", handleSlidersLockedUpdated)
       window.removeEventListener("updateProgress", handleProgressUpdated)
       window.removeEventListener("nightLightUpdated", handleNightLightUpdated)
       window.removeEventListener("darkModeUpdated", handleDarkModeUpdated)
@@ -404,7 +446,7 @@ const BrightnessPanel = memo(function BrightnessPanel() {
 
   const getMonitors = () => {
     if (!state.monitors || numMonitors == 0) {
-      if (state.isRefreshing) {
+      if (state.slidersLocked) {
         return (<div className="no-displays-message" style={{ textAlign: "center", paddingBottom: "15px" }}>{T.t("GENERIC_DETECTING_DISPLAYS")}</div>)
       }
       return (<div className="no-displays-message">{T.t("GENERIC_NO_COMPATIBLE_DISPLAYS")}</div>)
@@ -609,7 +651,7 @@ const BrightnessPanel = memo(function BrightnessPanel() {
   }
 
   return (
-    <div className="window-base" data-theme={window.settings.theme || "default"} id="panel" data-refreshing={state.isRefreshing}>
+    <div className="window-base" data-theme={window.settings.theme || "default"} id="panel" data-sliders-locked={state.slidersLocked}>
       <div className="titlebar">
         <div className="title">{T.t("PANEL_TITLE")}</div>
         <div className="icons">
